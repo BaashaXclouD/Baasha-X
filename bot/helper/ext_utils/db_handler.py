@@ -1,7 +1,7 @@
 from os import path as ospath, makedirs
 from psycopg2 import connect, DatabaseError
 
-from bot import DB_URI, AUTHORIZED_CHATS, SUDO_USERS, AS_DOC_USERS, AS_MEDIA_USERS, rss_dict, LOGGER, botname
+from bot import DB_URI, AUTHORIZED_CHATS, SUDO_USERS, AS_DOC_USERS, AS_MEDIA_USERS, rss_dict, LOGGER, botname, PRE_DICT
 
 class DbManger:
     def __init__(self):
@@ -30,6 +30,7 @@ class DbManger:
                  media boolean DEFAULT FALSE,
                  doc boolean DEFAULT FALSE,
                  thumb bytea DEFAULT NULL
+                 pre text DEFAULT ''
               )
               """
         self.cur.execute(sql)
@@ -67,6 +68,8 @@ class DbManger:
                         makedirs('Thumbnails')
                     with open(path, 'wb+') as f:
                         f.write(row[5])
+                if row[6]:
+                    PRE_DICT[row[0]] = row[6]
             LOGGER.info("Users data has been imported from Database")
         # Rss Data
         self.cur.execute("SELECT * FROM rss")
@@ -146,6 +149,17 @@ class DbManger:
         else:
             sql = 'UPDATE users SET media = FALSE, doc = TRUE WHERE uid = {}'.format(user_id)
         self.cur.execute(sql)
+        self.conn.commit()
+        self.disconnect()
+        
+    def user_pre(self, user_id: int, user_pre):
+        if self.err:
+            return
+        elif not self.user_check(user_id):
+            sql = 'INSERT INTO users (pre, uid) VALUES (%s, %s)'
+        else:
+            sql = 'UPDATE users SET pre = %s WHERE uid = %s'
+        self.cur.execute(sql, (user_pre, user_id))
         self.conn.commit()
         self.disconnect()
 
