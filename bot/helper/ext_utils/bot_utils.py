@@ -1,446 +1,262 @@
-from re import findall as re_findall
-from threading import Thread, Event
-from time import time
-from math import ceil
-from html import escape
-from psutil import virtual_memory, cpu_percent, disk_usage, net_io_counters
-from requests import head as rhead
-from urllib.request import urlopen
-from telegram import InlineKeyboardMarkup
-from telegram.message import Message
-from telegram.ext import CallbackQueryHandler
+from os import path as ospath, makedirs
+from psycopg2 import connect, DatabaseError
 
-from bot import download_dict, download_dict_lock, STATUS_LIMIT, botStartTime, DOWNLOAD_DIR, WEB_PINCODE, BASE_URL, status_reply_dict, status_reply_dict_lock, dispatcher, bot, OWNER_ID, LOGGER
-from bot.helper.telegram_helper.bot_commands import BotCommands
-from bot.helper.telegram_helper.button_build import ButtonMaker
+from bot import DB_URI, AUTHORIZED_CHATS, SUDO_USERS, AS_DOC_USERS, AS_MEDIA_USERS, rss_dict, LOGGER, botname, PRE_DICT
 
-MAGNET_REGEX = r"magnet:\?xt=urn:btih:[a-zA-Z0-9]*"
+class DbManger:
+    def __init__(self):
+        self.err = False
+        self.connect()
 
-URL_REGEX = r"(?:(?:https?|ftp):\/\/)?[\w/\-?=%.]+\.[\w/\-?=%.]+"
-
-COUNT = 0
-PAGE_NO = 1
-
-
-class MirrorStatus:
-    STATUS_UPLOADING = "𝗨𝗽𝗹𝗼𝗮𝗱𝗶𝗻𝗴...📤"
-    STATUS_DOWNLOADING = "𝗗𝗼𝘄𝗻𝗹𝗼𝗮𝗱𝗶𝗻𝗴...📥"
-    STATUS_CLONING = "𝗖𝗹𝗼𝗻𝗶𝗻𝗴...♻️"
-    STATUS_WAITING = "𝗤𝘂𝗲𝘂𝗲𝗱...💤"
-    STATUS_PAUSE = "𝗣𝗮𝘂𝘀𝗲𝗱...⛔️"
-    STATUS_ARCHIVING = "𝗔𝗿𝗰𝗵𝗶𝘃𝗶𝗻𝗴...🔐"
-    STATUS_EXTRACTING = "𝗘𝘅𝘁𝗿𝗮𝗰𝘁𝗶𝗻𝗴...📂"
-    STATUS_SPLITTING = "𝗦𝗽𝗹𝗶𝘁𝘁𝗶𝗻𝗴...✂️"
-    STATUS_CHECKING = "𝗖𝗵𝗲𝗰𝗸𝗶𝗻𝗴𝗨𝗽...📝"
-    STATUS_SEEDING = "𝗦𝗲𝗲𝗱𝗶𝗻𝗴...🌧"
-
-class EngineStatus:
-    STATUS_ARIA = "Aria2c📶"
-    STATUS_GDRIVE = "Google API♻️"
-    STATUS_MEGA = "Mega API⭕️"
-    STATUS_QB = "qBittorrent🦠"
-    STATUS_TG = "Pyrogram💥"
-    STATUS_YT = "Yt-dlp🌟"
-    STATUS_EXT = "extract | pextract⚔️"
-    STATUS_SPLIT = "FFmpeg✂️"
-    STATUS_ZIP = "7z🛠"
-
-PROGRESS_MAX_SIZE = 100 // 10 
-PROGRESS_INCOMPLETE = ['◔', '◔', '◑', '◑', '◑', '◕', '◕']
-
-SIZE_UNITS = ['B', 'KB', 'MB', 'GB', 'TB', 'PB']
-
-
-class setInterval:
-    def __init__(self, interval, action):
-        self.interval = interval
-        self.action = action
-        self.stopEvent = Event()
-        thread = Thread(target=self.__setInterval)
-        thread.start()
-
-    def __setInterval(self):
-        nextTime = time() + self.interval
-        while not self.stopEvent.wait(nextTime - time()):
-            nextTime += self.interval
-            self.action()
-
-    def cancel(self):
-        self.stopEvent.set()
-
-def get_readable_file_size(size_in_bytes) -> str:
-    if size_in_bytes is None:
-        return '0B'
-    index = 0
-    while size_in_bytes >= 1024:
-        size_in_bytes /= 1024
-        index += 1
-    try:
-        return f'{round(size_in_bytes, 2)}{SIZE_UNITS[index]}'
-    except IndexError:
-        return 'File too large'
-
-def getDownloadByGid(gid):
-    with download_dict_lock:
-        for dl in list(download_dict.values()):
-            if dl.gid() == gid:
-                return dl
-    return None
-
-def getAllDownload(req_status: str):
-    with download_dict_lock:
-        for dl in list(download_dict.values()):
-            status = dl.status()
-            if req_status in ['all', status]:
-                return dl
-    return None
-
-def bt_selection_buttons(id_: str):
-    if len(id_) > 20:
-        gid = id_[:12]
-    else:
-        gid = id_
-
-    pincode = ""
-    for n in id_:
-        if n.isdigit():
-            pincode += str(n)
-        if len(pincode) == 4:
-            break
-
-    buttons = ButtonMaker()
-    if WEB_PINCODE:
-        buttons.buildbutton("Select Files", f"{BASE_URL}/app/files/{id_}")
-        buttons.sbutton("Pincode", f"btsel pin {gid} {pincode}")
-    else:
-        buttons.buildbutton("Select Files", f"{BASE_URL}/app/files/{id_}?pin_code={pincode}")
-    buttons.sbutton("Done Selecting", f"btsel done {gid} {id_}")
-    return InlineKeyboardMarkup(buttons.build_menu(2))
-
-def get_progress_bar_string(status):
-    completed = status.processed_bytes() / 8
-    total = status.size_raw() / 8
-    p = 0 if total == 0 else round(completed * 100 / total)
-    p = min(max(p, 0), 100)
-    cFull = p // 8
-    cPart = p % 8 - 1
-    p_str = '●' * cFull
-    if cPart >= 0:
-        p_str += PROGRESS_INCOMPLETE[cPart]
-    p_str += '○' * (PROGRESS_MAX_SIZE - cFull)
-    p_str = f"「{p_str}」"
-    return p_str
-
-def progress_bar(percentage):
-    comp = '▓'
-    ncomp = '░'
-    pr = ""
-    if isinstance(percentage, str):
-        return "NaN"
-    try:
-        percentage=int(percentage)
-    except:
-        percentage = 0
-    for i in range(1,11):
-        if i <= int(percentage/10):
-            pr += comp
-        else:
-            pr += ncomp
-    return pr
-
-def editMessage(text: str, message: Message, reply_markup=None):
-    try:
-        bot.editMessageText(text=text, message_id=message.message_id,
-                              chat_id=message.chat.id,reply_markup=reply_markup,
-                              parse_mode='HTMl', disable_web_page_preview=True)
-    except RetryAfter as r:
-        LOGGER.warning(str(r))
-        sleep(r.retry_after * 1.5)
-        return editMessage(text, message, reply_markup)
-    except Exception as e:
-        LOGGER.error(str(e))
-        return str(e)
-
-def update_all_messages():
-    msg, buttons = get_readable_message()
-    with status_reply_dict_lock:
-        for chat_id in list(status_reply_dict.keys()):
-            if status_reply_dict[chat_id] and msg != status_reply_dict[chat_id].text:
-                if buttons == "":
-                    editMessage(msg, status_reply_dict[chat_id])
-                else:
-                    editMessage(msg, status_reply_dict[chat_id], buttons)
-                status_reply_dict[chat_id].text = msg
-
-def get_readable_message():
-    with download_dict_lock:
-        dlspeed_bytes = 0
-        uldl_bytes = 0
-        START = 0
-        num_active = 0
-        num_seeding = 0
-        num_upload = 0
-        for stats in list(download_dict.values()):
-            if stats.status() == MirrorStatus.STATUS_DOWNLOADING:
-               num_active += 1
-            if stats.status() == MirrorStatus.STATUS_UPLOADING:
-               num_upload += 1
-            if stats.status() == MirrorStatus.STATUS_SEEDING:
-               num_seeding += 1
-        if STATUS_LIMIT is not None:
-            tasks = len(download_dict)
-            global pages
-            pages = ceil(tasks/STATUS_LIMIT)
-            if PAGE_NO > pages and pages != 0:
-                globals()['COUNT'] -= STATUS_LIMIT
-                globals()['PAGE_NO'] -= 1
-        msg = f"<b>| 𝗗𝗼𝘄𝗻𝗹𝗼𝗮𝗱𝗶𝗻𝗴: {num_active} || 𝗨𝗽𝗹𝗼𝗮𝗱𝗶𝗻𝗴: {num_upload} || 𝗦𝗲𝗲𝗱𝗶𝗻𝗴: {num_seeding} |</b>\n\n<b>▬▬▬ @BaashaXclouD ▬▬▬</b>\n"
-        for index, download in enumerate(list(download_dict.values())[COUNT:], start=1):
-            msg += f"\n𝗙𝗶𝗹𝗲𝗻𝗮𝗺𝗲: <code>{download.name()}</code>"
-            msg += f"\n𝗦𝘁𝗮𝘁𝘂𝘀: <i>{download.status()}</i>"
-            msg += f"\n𝗘𝗻𝗴𝗶𝗻𝗲: {download.eng()}"
-            if download.status() not in [MirrorStatus.STATUS_SPLITTING, MirrorStatus.STATUS_SEEDING]:
-                msg += f"\n{get_progress_bar_string(download)} {download.progress()}"
-                if download.status() in [MirrorStatus.STATUS_DOWNLOADING,
-                                         MirrorStatus.STATUS_WAITING,
-                                         MirrorStatus.STATUS_PAUSED]:
-                    msg += f"\n𝗗𝗼𝘄𝗻𝗹𝗼𝗮𝗱𝗲𝗱: {get_readable_file_size(download.processed_bytes())} of {download.size()}"
-                elif download.status() == MirrorStatus.STATUS_UPLOADING:
-                    msg += f"\n𝗨𝗽𝗹𝗼𝗮𝗱𝗲𝗱: {get_readable_file_size(download.processed_bytes())} of {download.size()}"
-                elif download.status() == MirrorStatus.STATUS_CLONING:
-                    msg += f"\n𝗖𝗹𝗼𝗻𝗲𝗱: {get_readable_file_size(download.processed_bytes())} of {download.size()}"
-                elif download.status() == MirrorStatus.STATUS_ARCHIVING:
-                    msg += f"\n<b>Archived:</b> {get_readable_file_size(download.processed_bytes())} of {download.size()}"
-                elif download.status() == MirrorStatus.STATUS_EXTRACTING:
-                    msg += f"\n<b>Extracted:</b> {get_readable_file_size(download.processed_bytes())} of {download.size()}"
-                msg += f"\n𝗦𝗽𝗲𝗲𝗱: {download.speed()} | 𝗘𝗧𝗔: {download.eta()}"
-                try:
-                    msg += f"\n𝗦𝗲𝗲𝗱𝗲𝗿𝘀: {download.aria_download().num_seeders}" \
-                           f" | 𝗣𝗲𝗲𝗿𝘀: {download.aria_download().connections}"
-                except:
-                    pass
-                try:
-                    msg += f"\n𝗦𝗲𝗲𝗱𝗲𝗿𝘀: {download.torrent_info().num_seeds}" \
-                           f" | 𝗟𝗲𝗲𝗰𝗵𝗲𝗿𝘀: {download.torrent_info().num_leechs}"
-                except:
-                    pass
-                if download.message.chat.type != 'private':
-                    try:
-                        chatid = str(download.message.chat.id)[4:]
-                        msg += f'\n𝗦𝗼𝘂𝗿𝗰𝗲 𝗟𝗶𝗻𝗸: <a href="https://t.me/c/{chatid}/{download.message.message_id}">Click Here</a>'
-                    except:
-                        pass
-                msg += f'\n<b>𝗨𝘀𝗲𝗿:</b> ️<code>{download.message.from_user.first_name}</code>️(<code>/warn {download.message.from_user.id}</code>)'
-            elif download.status() == MirrorStatus.STATUS_SEEDING:
-                msg += f"\n𝗦𝗶𝘇𝗲: {download.size()}"
-                msg += f"\n𝗦𝗽𝗲𝗲𝗱: {get_readable_file_size(download.torrent_info().upspeed)}/s"
-                msg += f" | 𝗨𝗽𝗹𝗼𝗮𝗱𝗲𝗱: {get_readable_file_size(download.torrent_info().uploaded)}"
-                msg += f"\n𝗥𝗮𝘁𝗶𝗼: {round(download.torrent_info().ratio, 3)}"
-                msg += f" | 𝗧𝗶𝗺𝗲: {get_readable_time(download.torrent_info().seeding_time)}"
-            else:
-                msg += f"\n𝗦𝗶𝘇𝗲: {download.size()}"
-            msg += f"\n𝗖𝗮𝗻𝗰𝗲𝗹: <code>/{BotCommands.CancelMirror} {download.gid()}</code>\n________________________________"
-            msg += "\n"
-            if STATUS_LIMIT is not None and index == STATUS_LIMIT:
-                break
-        if len(msg) == 0:
-            return None, None
-        currentTime = get_readable_time(time() - botStartTime)
-        dlspeed_bytes = 0
-        upspeed_bytes = 0
-        for download in list(download_dict.values()):
-            spd = download.speed()
-            if download.status() == MirrorStatus.STATUS_DOWNLOADING:
-                if 'K' in spd:
-                    dlspeed_bytes += float(spd.split('K')[0]) * 1024
-                elif 'M' in spd:
-                    dlspeed_bytes += float(spd.split('M')[0]) * 1048576
-            elif download.status() == MirrorStatus.STATUS_UPLOADING:
-                if 'KB/s' in spd:
-                    upspeed_bytes += float(spd.split('K')[0]) * 1024
-                elif 'MB/s' in spd:
-                    upspeed_bytes += float(spd.split('M')[0]) * 1048576
-        msg += f"\n📖 𝗣𝗮𝗴𝗲𝘀: {PAGE_NO}/{pages} | 📝 𝗧𝗮𝘀𝗸𝘀: {tasks}"
-        msg += f"\n𝗕𝗢𝗧 𝗨𝗣𝗧𝗜𝗠𝗘⏰: <code>{currentTime}</code>"
-        msg += f"\n𝗗𝗹: {get_readable_file_size(dlspeed_bytes)}/s🔻 | 𝗨𝗹: {get_readable_file_size(upspeed_bytes)}/s🔺"
-        buttons = ButtonMaker()
-        buttons.sbutton("🔄", str(ONE))
-        buttons.sbutton("❌", str(TWO))
-        buttons.sbutton("📈", str(THREE))
-        sbutton = InlineKeyboardMarkup(buttons.build_menu(3))
-        if STATUS_LIMIT is not None and tasks > STATUS_LIMIT:
-            buttons = ButtonMaker()
-            buttons.sbutton("⬅️", "status pre")
-            buttons.sbutton("❌", str(TWO))
-            buttons.sbutton("➡️", "status nex")
-            buttons.sbutton("🔄", str(ONE))
-            buttons.sbutton("📈", str(THREE))
-            button = InlineKeyboardMarkup(buttons.build_menu(3))
-            return msg, button
-        return msg, ""
-
-def stats(update, context):
-    query = update.callback_query
-    stats = bot_sys_stats()
-    query.answer(text=stats, show_alert=True)
-
-def bot_sys_stats():
-    currentTime = get_readable_time(time() - botStartTime)
-    cpu = cpu_percent(interval=0.5)
-    memory = virtual_memory()
-    mem = memory.percent
-    total, used, free, disk= disk_usage('/')
-    total = get_readable_file_size(total)
-    used = get_readable_file_size(used)
-    free = get_readable_file_size(free)
-    recv = get_readable_file_size(net_io_counters().bytes_recv)
-    sent = get_readable_file_size(net_io_counters().bytes_sent)
-    stats = f"""
-BOT UPTIME⏰: {currentTime}
-
-CPU: {progress_bar(cpu)} {cpu}%
-RAM: {progress_bar(mem)} {mem}%
-DISK: {progress_bar(disk)} {disk}%
-
-TOTAL: {total}
-
-USED: {used} || FREE: {free}
-SENT: {sent} || RECV: {recv}
-
-#BaashaXclouD
-"""
-    return stats
-
-def turn(data):
-    try:
-        with download_dict_lock:
-            global COUNT, PAGE_NO
-            if data[1] == "nex":
-                if PAGE_NO == pages:
-                    COUNT = 0
-                    PAGE_NO = 1
-                else:
-                    COUNT += STATUS_LIMIT
-                    PAGE_NO += 1
-            elif data[1] == "pre":
-                if PAGE_NO == 1:
-                    COUNT = STATUS_LIMIT * (pages - 1)
-                    PAGE_NO = pages
-                else:
-                    COUNT -= STATUS_LIMIT
-                    PAGE_NO -= 1
-        return True
-    except:
-        return False
-
-def get_readable_time(seconds: int) -> str:
-    result = ''
-    (days, remainder) = divmod(seconds, 86400)
-    days = int(days)
-    if days != 0:
-        result += f'{days}d'
-    (hours, remainder) = divmod(remainder, 3600)
-    hours = int(hours)
-    if hours != 0:
-        result += f'{hours}h'
-    (minutes, seconds) = divmod(remainder, 60)
-    minutes = int(minutes)
-    if minutes != 0:
-        result += f'{minutes}m'
-    seconds = int(seconds)
-    result += f'{seconds}s'
-    return result
-
-ONE, TWO, THREE = range(3)
-                
-def refresh(update, context):
-    chat_id  = update.effective_chat.id
-    query = update.callback_query
-    user_id = update.callback_query.from_user.id
-    first = update.callback_query.from_user.first_name
-    query.edit_message_text(text=f"{first} Refreshing...👻")
-    sleep(2)
-    update_all_messages()
-    query.answer(text="Refreshed", show_alert=False)
-    
-def close(update, context):  
-    chat_id  = update.effective_chat.id
-    user_id = update.callback_query.from_user.id
-    bot = context.bot
-    query = update.callback_query
-    admins = bot.get_chat_member(chat_id, user_id).status in ['creator', 'administrator'] or user_id in [OWNER_ID] 
-    if admins: 
-        query.answer()  
-        query.message.delete() 
-    else:  
-        query.answer(text="Nice Try, Get Lost🥱.\n\nOnly Admins can use this.", show_alert=True)
-        
-def get_readable_time(seconds: int) -> str:
-    result = ''
-    (days, remainder) = divmod(seconds, 86400)
-    days = int(days)
-    if days != 0:
-        result += f'{days}d'
-    (hours, remainder) = divmod(remainder, 3600)
-    hours = int(hours)
-    if hours != 0:
-        result += f'{hours}h'
-    (minutes, seconds) = divmod(remainder, 60)
-    minutes = int(minutes)
-    if minutes != 0:
-        result += f'{minutes}m'
-    seconds = int(seconds)
-    result += f'{seconds}s'
-    return result
-
-def is_url(url: str):
-    url = re_findall(URL_REGEX, url)
-    return bool(url)
-
-def is_gdrive_link(url: str):
-    return "drive.google.com" in url
-
-def is_mega_link(url: str):
-    return "mega.nz" in url or "mega.co.nz" in url
-
-def get_mega_link_type(url: str):
-    if "folder" in url:
-        return "folder"
-    elif "file" in url:
-        return "file"
-    elif "/#F!" in url:
-        return "folder"
-    return "file"
-
-def is_magnet(url: str):
-    magnet = re_findall(MAGNET_REGEX, url)
-    return bool(magnet)
-
-def new_thread(fn):
-    """To use as decorator to make a function call threaded.
-    Needs import
-    from threading import Thread"""
-
-    def wrapper(*args, **kwargs):
-        thread = Thread(target=fn, args=args, kwargs=kwargs)
-        thread.start()
-        return thread
-
-    return wrapper
-
-def get_content_type(link: str) -> str:
-    try:
-        res = rhead(link, allow_redirects=True, timeout=5, headers = {'user-agent': 'Wget/1.12'})
-        content_type = res.headers.get('content-type')
-    except:
+    def connect(self):
         try:
-            res = urlopen(link, timeout=5)
-            info = res.info()
-            content_type = info.get_content_type()
-        except:
-            content_type = None
-    return content_type
+            self.conn = connect(DB_URI)
+            self.cur = self.conn.cursor()
+        except DatabaseError as error:
+            LOGGER.error(f"Error in DB connection: {error}")
+            self.err = True
 
-dispatcher.add_handler(CallbackQueryHandler(refresh, pattern='^' + str(ONE) + '$'))
-dispatcher.add_handler(CallbackQueryHandler(close, pattern='^' + str(TWO) + '$'))
-dispatcher.add_handler(CallbackQueryHandler(stats, pattern='^' + str(THREE) + '$'))
+    def disconnect(self):
+        self.cur.close()
+        self.conn.close()
+
+    def db_init(self):
+        if self.err:
+            return
+        sql = """CREATE TABLE IF NOT EXISTS users (
+                 uid bigint,
+                 sudo boolean DEFAULT FALSE,
+                 auth boolean DEFAULT FALSE,
+                 media boolean DEFAULT FALSE,
+                 doc boolean DEFAULT FALSE,
+                 thumb bytea DEFAULT NULL
+                 pre text DEFAULT ''
+              )
+              """
+        self.cur.execute(sql)
+        sql = """CREATE TABLE IF NOT EXISTS rss (
+                 name text,
+                 link text,
+                 last text,
+                 title text,
+                 filters text
+              )
+              """
+        self.cur.execute(sql)
+        self.cur.execute("CREATE TABLE IF NOT EXISTS {} (cid bigint, link text, tag text)".format(botname))
+        self.conn.commit()
+        LOGGER.info("Database Initiated")
+        self.db_load()
+
+    def db_load(self):
+        # User Data
+        self.cur.execute("SELECT * from users")
+        rows = self.cur.fetchall()  # return a list ==> (uid, sudo, auth, media, doc, thumb)
+        if rows:
+            for row in rows:
+                if row[1] and row[0] not in SUDO_USERS:
+                    SUDO_USERS.add(row[0])
+                elif row[2] and row[0] not in AUTHORIZED_CHATS:
+                    AUTHORIZED_CHATS.add(row[0])
+                if row[3]:
+                    AS_MEDIA_USERS.add(row[0])
+                elif row[4]:
+                    AS_DOC_USERS.add(row[0])
+                path = f"Thumbnails/{row[0]}.jpg"
+                if row[5] is not None and not ospath.exists(path):
+                    if not ospath.exists('Thumbnails'):
+                        makedirs('Thumbnails')
+                    with open(path, 'wb+') as f:
+                        f.write(row[5])
+                if row[6]:
+                    PRE_DICT[row[0]] = row[6]
+            LOGGER.info("Users data has been imported from Database")
+        # Rss Data
+        self.cur.execute("SELECT * FROM rss")
+        rows = self.cur.fetchall()  # return a list ==> (name, feed_link, last_link, last_title, filters)
+        if rows:
+            for row in rows:
+                f_lists = []
+                if row[4] is not None:
+                    filters_list = row[4].split('|')
+                    for x in filters_list:
+                        y = x.split(' or ')
+                        f_lists.append(y)
+                rss_dict[row[0]] = [row[1], row[2], row[3], f_lists]
+            LOGGER.info("Rss data has been imported from Database.")
+        self.disconnect()
+
+    def user_auth(self, chat_id: int):
+        if self.err:
+            return "Error in DB connection, check log for details"
+        elif not self.user_check(chat_id):
+            sql = 'INSERT INTO users (uid, auth) VALUES ({}, TRUE)'.format(chat_id)
+        else:
+            sql = 'UPDATE users SET auth = TRUE WHERE uid = {}'.format(chat_id)
+        self.cur.execute(sql)
+        self.conn.commit()
+        self.disconnect()
+        return 'Authorized successfully'
+
+    def user_unauth(self, chat_id: int):
+        if self.err:
+            return "Error in DB connection, check log for details"
+        elif self.user_check(chat_id):
+            sql = 'UPDATE users SET auth = FALSE WHERE uid = {}'.format(chat_id)
+            self.cur.execute(sql)
+            self.conn.commit()
+            self.disconnect()
+            return 'Unauthorized successfully'
+
+    def user_addsudo(self, user_id: int):
+        if self.err:
+            return "Error in DB connection, check log for details"
+        elif not self.user_check(user_id):
+            sql = 'INSERT INTO users (uid, sudo) VALUES ({}, TRUE)'.format(user_id)
+        else:
+            sql = 'UPDATE users SET sudo = TRUE WHERE uid = {}'.format(user_id)
+        self.cur.execute(sql)
+        self.conn.commit()
+        self.disconnect()
+        return 'Successfully Promoted as Sudo'
+
+    def user_rmsudo(self, user_id: int):
+        if self.err:
+            return "Error in DB connection, check log for details"
+        elif self.user_check(user_id):
+            sql = 'UPDATE users SET sudo = FALSE WHERE uid = {}'.format(user_id)
+            self.cur.execute(sql)
+            self.conn.commit()
+            self.disconnect()
+            return 'Successfully removed from Sudo'
+
+    def user_media(self, user_id: int):
+        if self.err:
+            return
+        elif not self.user_check(user_id):
+            sql = 'INSERT INTO users (uid, media) VALUES ({}, TRUE)'.format(user_id)
+        else:
+            sql = 'UPDATE users SET media = TRUE, doc = FALSE WHERE uid = {}'.format(user_id)
+        self.cur.execute(sql)
+        self.conn.commit()
+        self.disconnect()
+
+    def user_doc(self, user_id: int):
+        if self.err:
+            return
+        elif not self.user_check(user_id):
+            sql = 'INSERT INTO users (uid, doc) VALUES ({}, TRUE)'.format(user_id)
+        else:
+            sql = 'UPDATE users SET media = FALSE, doc = TRUE WHERE uid = {}'.format(user_id)
+        self.cur.execute(sql)
+        self.conn.commit()
+        self.disconnect()
+        
+    def user_pre(self, user_id: int, user_pre):
+        if self.err:
+            return
+        elif not self.user_check(user_id):
+            sql = 'INSERT INTO users (pre, uid) VALUES (%s, %s)'
+        else:
+            sql = 'UPDATE users SET pre = %s WHERE uid = %s'
+        self.cur.execute(sql, (user_pre, user_id))
+        self.conn.commit()
+        self.disconnect()
+
+    def user_save_thumb(self, user_id: int, path):
+        if self.err:
+            return
+        image = open(path, 'rb+')
+        image_bin = image.read()
+        if not self.user_check(user_id):
+            sql = 'INSERT INTO users (thumb, uid) VALUES (%s, %s)'
+        else:
+            sql = 'UPDATE users SET thumb = %s WHERE uid = %s'
+        self.cur.execute(sql, (image_bin, user_id))
+        self.conn.commit()
+        self.disconnect()
+
+    def user_rm_thumb(self, user_id: int, path):
+        if self.err:
+            return
+        elif self.user_check(user_id):
+            sql = 'UPDATE users SET thumb = NULL WHERE uid = {}'.format(user_id)
+        self.cur.execute(sql)
+        self.conn.commit()
+        self.disconnect()
+
+    def user_check(self, uid: int):
+        self.cur.execute("SELECT * FROM users WHERE uid = {}".format(uid))
+        res = self.cur.fetchone()
+        return res
+
+    def rss_add(self, name, link, last, title, filters):
+        if self.err:
+            return
+        q = (name, link, last, title, filters)
+        self.cur.execute("INSERT INTO rss (name, link, last, title, filters) VALUES (%s, %s, %s, %s, %s)", q)
+        self.conn.commit()
+        self.disconnect()
+
+    def rss_update(self, name, last, title):
+        if self.err:
+            return
+        q = (last, title, name)
+        self.cur.execute("UPDATE rss SET last = %s, title = %s WHERE name = %s", q)
+        self.conn.commit()
+        self.disconnect()
+
+    def rss_delete(self, name):
+        if self.err:
+            return
+        self.cur.execute("DELETE FROM rss WHERE name = %s", (name,))
+        self.conn.commit()
+        self.disconnect()
+
+    def add_incomplete_task(self, cid: int, link: str, tag: str):
+        if self.err:
+            return
+        q = (cid, link, tag)
+        self.cur.execute("INSERT INTO {} (cid, link, tag) VALUES (%s, %s, %s)".format(botname), q)
+        self.conn.commit()
+        self.disconnect()
+
+    def rm_complete_task(self, link: str):
+        if self.err:
+            return
+        self.cur.execute("DELETE FROM {} WHERE link = %s".format(botname), (link,))
+        self.conn.commit()
+        self.disconnect()
+
+    def get_incomplete_tasks(self):
+        if self.err:
+            return False
+        self.cur.execute("SELECT * from {}".format(botname))
+        rows = self.cur.fetchall()  # return a list ==> (cid, link, tag)
+        notifier_dict = {}
+        if rows:
+            for row in rows:
+                if row[0] in list(notifier_dict.keys()):
+                    if row[2] in list(notifier_dict[row[0]].keys()):
+                        notifier_dict[row[0]][row[2]].append(row[1])
+                    else:
+                        notifier_dict[row[0]][row[2]] = [row[1]]
+                else:
+                    usr_dict = {}
+                    usr_dict[row[2]] = [row[1]]
+                    notifier_dict[row[0]] = usr_dict
+        self.cur.execute("TRUNCATE TABLE {}".format(botname))
+        self.conn.commit()
+        self.disconnect()
+        return notifier_dict # return a dict ==> {cid: {tag: [mid, mid, ...]}}
+
+
+    def trunc_table(self, name):
+        if self.err:
+            return
+        self.cur.execute("TRUNCATE TABLE {}".format(name))
+        self.conn.commit()
+        self.disconnect()
+
+if DB_URI is not None:
+    DbManger().db_init()
